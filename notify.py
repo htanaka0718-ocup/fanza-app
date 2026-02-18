@@ -100,8 +100,8 @@ def get_gspread_client():
     # Secrets TOML 内に gcp_service_account セクションがあれば dict から認証
     sa_info = _load_service_account_from_secrets()
     if sa_info:
-        raw_key = sa_info["private_key"].replace("\\n", "\n")
-        sa_info["private_key"] = "\n".join([line.strip() for line in raw_key.split("\n")])
+        p_key = sa_info["private_key"].replace("\\n", "\n")
+        sa_info["private_key"] = "\n".join([line.strip() for line in p_key.split("\n") if line.strip()])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(sa_info, SCOPES)
     elif os.path.exists(SERVICE_ACCOUNT_FILE):
         creds = ServiceAccountCredentials.from_json_keyfile_name(
