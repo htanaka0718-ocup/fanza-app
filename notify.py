@@ -74,15 +74,42 @@ SCOPES = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
+
+def _load_service_account_from_secrets() -> dict | None:
+    """secrets.toml の [gcp_service_account] セクションを読み込む。"""
+    if not os.path.exists(SECRETS_PATH):
+        return None
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib  # Python < 3.11 向けフォールバック
+    with open(SECRETS_PATH, "rb") as f:
+        data = tomllib.load(f)
+    sa = data.get("gcp_service_account")
+    if sa and isinstance(sa, dict) and "private_key" in sa:
+        return dict(sa)
+    return None
+
+
 SERVICE_ACCOUNT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "service_account.json"
 )
 
 
 def get_gspread_client():
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        SERVICE_ACCOUNT_FILE, SCOPES
-    )
+    # Secrets TOML 内に gcp_service_account セクションがあれば dict から認証
+    sa_info = _load_service_account_from_secrets()
+    if sa_info:
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(sa_info, SCOPES)
+    elif os.path.exists(SERVICE_ACCOUNT_FILE):
+        creds = ServiceAccountCredentials.from_json_keyfile_name(
+            SERVICE_ACCOUNT_FILE, SCOPES
+        )
+    else:
+        raise FileNotFoundError(
+            "service_account.json が見つからず、secrets.toml にも"
+            " [gcp_service_account] セクションがありません。"
+        )
     return gspread.authorize(creds)
 
 
