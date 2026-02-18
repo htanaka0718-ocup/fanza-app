@@ -1,0 +1,6 @@
+streamlit
+streamlit-sortables
+requests
+gspread
+oauth2client
+pandas
