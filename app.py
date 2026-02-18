@@ -398,7 +398,7 @@ SERVICE_ACCOUNT_FILE = "service_account.json"
 def _get_gspread_client():
     if "gcp_service_account" in st.secrets:
         sa = dict(st.secrets["gcp_service_account"])
-        sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+        sa["private_key"] = sa["private_key"].replace("\\n", "\n").strip()
         creds = ServiceAccountCredentials.from_json_keyfile_dict(sa, SCOPES)
     else:
         creds = ServiceAccountCredentials.from_json_keyfile_name(
