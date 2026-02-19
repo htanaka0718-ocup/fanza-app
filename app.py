@@ -55,6 +55,14 @@ st.markdown(
         color: var(--txt) !important;
     }
     [data-testid="stHeader"] { background: transparent !important; }
+    /* Streamlit デプロイメニュー (Share/Star) を非表示 */
+    [data-testid="stToolbar"],
+    [data-testid="stDecoration"],
+    #MainMenu,
+    header [data-testid="stActionButtonIcon"],
+    .stDeployButton {
+        display: none !important;
+    }
     .block-container { max-width: 100%; padding: 1rem 2rem; }
 
     /* ===== ボタン全般 ===== */
@@ -1021,7 +1029,7 @@ else:
                 actress_id = str(actress["actress_id"])
                 try:
                     raw = search_items_by_actress(actress_id, hits=30)
-                    good = filter_items(raw)
+                    good = filter_items(raw, require_sample_video=True)
                     for it in good:
                         it["_actress_name"] = name
                     all_latest.extend(good)

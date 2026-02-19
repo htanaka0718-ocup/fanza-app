@@ -7,12 +7,18 @@ daily_notifier.py − GitHub Actions 用 FANZA 新着通知
 認証優先順位:
   1. 環境変数 GCP_SERVICE_ACCOUNT_JSON (JSON文字列)
   2. ローカルの service_account.json ファイル
+
+通知ロジック:
+  - app.py と同じフロア (mono/dvd) で検索
+  - 過去30日以内の作品のみ対象 (初回爆撃防止)
+  - sent_works に記録済みの content_id は通知しない
 """
 
 import os
 import sys
 import json
 import time
+from datetime import datetime, timedelta
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -49,7 +55,6 @@ def get_gspread_client():
     sa_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "")
     if sa_json:
         sa_info = json.loads(sa_json)
-        # private_key の改行を正規化
         p_key = sa_info["private_key"].replace("\\n", "\n")
         sa_info["private_key"] = "\n".join(
             [line.strip() for line in p_key.split("\n") if line.strip()]
@@ -83,9 +88,12 @@ def ensure_sheet(client, tab_name: str, headers: list[str]):
 
 
 # ---------------------------------------------------------------------------
-# DMM API
+# DMM API (app.py と同じフロア: mono/dvd)
 # ---------------------------------------------------------------------------
 DMM_ITEM_ENDPOINT = "https://api.dmm.com/affiliate/v3/ItemList"
+
+# 過去何日以内の作品を通知対象とするか
+CUTOFF_DAYS = 30
 
 
 def search_items_by_actress(actress_id: str, hits: int = 30) -> list[dict]:
@@ -93,8 +101,8 @@ def search_items_by_actress(actress_id: str, hits: int = 30) -> list[dict]:
         "api_id": API_ID,
         "affiliate_id": AFFILIATE_ID,
         "site": "FANZA",
-        "service": "digital",
-        "floor": "videoa",
+        "service": "mono",
+        "floor": "dvd",
         "article": "actress",
         "article_id": actress_id,
         "hits": hits,
@@ -104,6 +112,17 @@ def search_items_by_actress(actress_id: str, hits: int = 30) -> list[dict]:
     resp = requests.get(DMM_ITEM_ENDPOINT, params=params, timeout=15)
     resp.raise_for_status()
     return resp.json().get("result", {}).get("items", [])
+
+
+def make_item_url(content_id: str) -> str:
+    """app.py と同じ URL 形式。"""
+    return f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={content_id}/"
+
+
+def is_recent(item: dict, cutoff_date: str) -> bool:
+    """作品の日付が cutoff_date 以降なら True。"""
+    date_str = item.get("date", "")[:10]
+    return date_str >= cutoff_date
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +135,8 @@ def send_discord_notification(actress_name: str, items: list[dict]):
     embeds = []
     for item in items[:10]:
         title = item.get("title", "タイトル不明")
-        url = item.get("affiliateURL") or item.get("URL", "")
+        cid = item.get("content_id", "")
+        url = make_item_url(cid) if cid else (item.get("affiliateURL") or item.get("URL", ""))
         date = item.get("date", "")[:10]
         img_url = (
             item.get("imageURL", {}).get("large", "")
@@ -167,6 +187,10 @@ def main():
     sent_records = ws_sent.get_all_records()
     known_ids = {str(r.get("content_id", "")) for r in sent_records}
 
+    # 過去30日のカットオフ日 (YYYY-MM-DD)
+    cutoff_date = (datetime.now() - timedelta(days=CUTOFF_DAYS)).strftime("%Y-%m-%d")
+    print(f"  カットオフ日: {cutoff_date} (これ以降の作品のみ通知)")
+
     total_new = 0
 
     for act in actresses:
@@ -178,16 +202,17 @@ def main():
         print(f"  検索中: {name} (ID: {actress_id})")
         try:
             raw_items = search_items_by_actress(actress_id)
-            # 共通フィルタ (max_items を大きめに設定して通知漏れを防ぐ)
             items = filter_items(raw_items, max_items=30)
         except Exception as e:
             print(f"  [ERROR] API呼び出し失敗: {e}")
             continue
 
-        # 未通知の作品を抽出
+        # 未通知 かつ 過去30日以内の作品のみ
         new_items = [
             item for item in items
-            if item.get("content_id") and str(item["content_id"]) not in known_ids
+            if item.get("content_id")
+            and str(item["content_id"]) not in known_ids
+            and is_recent(item, cutoff_date)
         ]
 
         if not new_items:
