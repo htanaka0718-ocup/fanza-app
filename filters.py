@@ -71,6 +71,11 @@ def filter_items(
             if not sample:
                 continue
 
+        # 商品画像がない作品を除外
+        img_urls = item.get("imageURL", {})
+        if not img_urls.get("large") and not img_urls.get("small"):
+            continue
+
         filtered.append(item)
         if len(filtered) >= max_items:
             break

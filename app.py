@@ -1020,21 +1020,31 @@ else:
     else:
         st.session_state.pop("extra_groups", None)
 
+        # --- 全女優のデータを1回で取得＆フィルタ (高速化) ---
+        filtered_cache: dict[str, list[dict]] = {}
+        for g in group_order:
+            for member in groups[g]:
+                actress_id = str(member["row"]["actress_id"])
+                if actress_id in filtered_cache:
+                    continue
+                try:
+                    raw = search_items_by_actress(actress_id, hits=30)
+                    filtered_cache[actress_id] = filter_items(
+                        raw, require_sample_video=True,
+                    )
+                except Exception:
+                    filtered_cache[actress_id] = []
+
         # --- 🔥 新着ピックアップ (全女優から最新10本) ---
         all_latest: list[dict] = []
         for g in group_order:
             for member in groups[g]:
                 actress = member["row"]
-                name = actress["name"]
                 actress_id = str(actress["actress_id"])
-                try:
-                    raw = search_items_by_actress(actress_id, hits=30)
-                    good = filter_items(raw, require_sample_video=True)
-                    for it in good:
-                        it["_actress_name"] = name
-                    all_latest.extend(good)
-                except Exception:
-                    pass
+                for it in filtered_cache.get(actress_id, []):
+                    # 一時属性を別 dict にして元データを汚さない
+                    entry = {**it, "_actress_name": actress["name"]}
+                    all_latest.append(entry)
 
         # 日付降順ソート → content_id で重複除去 → 先頭10件
         all_latest.sort(key=lambda x: x.get("date", ""), reverse=True)
@@ -1055,7 +1065,6 @@ else:
                 unsafe_allow_html=True,
             )
             st.caption("登録女優の最新作品")
-            # 横スクロールカード (女優名付き)
             cards = []
             for item in unique_latest:
                 title = item.get("title", "タイトル不明")
@@ -1081,7 +1090,7 @@ else:
             )
             st.markdown("---")
 
-        # --- グループ別一覧 ---
+        # --- グループ別一覧 (キャッシュ再利用) ---
         for g in group_order:
             members = groups[g]
             with st.expander(f"📂 {g}（{len(members)}人）", expanded=False):
@@ -1092,14 +1101,8 @@ else:
                     face_url = str(actress.get("image_url", ""))
 
                     render_actress_header(name, face_url)
-
-                    try:
-                        items = search_items_by_actress(actress_id, hits=30)
-                        items = filter_items(items)
-                    except Exception as e:
-                        st.error(f"API エラー: {e}")
-                        items = []
-
+                    items = filtered_cache.get(actress_id, [])
                     render_hscroll(items)
                     st.markdown("---")
+
 
