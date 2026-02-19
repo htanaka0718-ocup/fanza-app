@@ -1,0 +1,32 @@
+name: Daily FANZA Check
+
+on:
+  schedule:
+    # UTC 09:00 = JST 18:00
+    - cron: '0 9 * * *'
+  workflow_dispatch: # 手動実行用
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    env:
+      GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+      DMM_API_ID: ${{ secrets.DMM_API_ID }}
+      DMM_AFFILIATE_ID: ${{ secrets.DMM_AFFILIATE_ID }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily notifier
+        run: python daily_notifier.py

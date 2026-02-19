@@ -15,6 +15,7 @@ import pandas as pd
 import urllib.parse
 from streamlit_sortables import sort_items
 from oauth2client.service_account import ServiceAccountCredentials
+from filters import filter_items
 
 # ---------------------------------------------------------------------------
 # ページ設定 & カスタムCSS (ブラック × ピンク テーマ)
@@ -357,17 +358,8 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
-# 定数 & 除外フィルタ
+# 定数（フィルタロジックは filters.py に統一済み）
 # ---------------------------------------------------------------------------
-EXCLUDE_WORDS = [
-    "ベスト", "総集編", "傑作選", "プレミアム",
-    "BEST", "100選", "4時間", "8時間", "【数量限定】",
-]
-EXCLUDE_TITLE_PREFIXES = ["【FANZA限定】", "【特選アウトレット】", "【プレコレ】", "【特典版】"]
-EXCLUDE_TITLE_SUFFIXES = ["（BOD）", "（ブルーレイディスク）"]
-EXCLUDE_GENRES = ["4時間以上作品", "VR専用"]
-_DUPE_PATTERN = re.compile(r"と同じ内容です。")
-MAX_PERFORMERS = 4
 MAX_ITEMS_PER_ACTRESS = 5
 
 # ---------------------------------------------------------------------------
@@ -464,33 +456,7 @@ def make_item_url(content_id: str) -> str:
     return f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={content_id}/"
 
 
-def filter_items(items: list[dict]) -> list[dict]:
-    filtered = []
-    for item in items:
-        title = item.get("title", "")
-        if any(w in title for w in EXCLUDE_WORDS):
-            continue
-        if any(title.startswith(p) for p in EXCLUDE_TITLE_PREFIXES):
-            continue
-        if any(title.rstrip().endswith(s) for s in EXCLUDE_TITLE_SUFFIXES):
-            continue
-        genres = item.get("iteminfo", {}).get("genre", [])
-        genre_names = [g.get("name", "") for g in genres]
-        if any(eg in genre_names for eg in EXCLUDE_GENRES):
-            continue
-        performers = item.get("iteminfo", {}).get("actress", [])
-        if len(performers) > MAX_PERFORMERS:
-            continue
-        item_desc = item.get("iteminfo", {}).get("comment", "")
-        if isinstance(item_desc, str) and _DUPE_PATTERN.search(item_desc):
-            continue
-        review = item.get("review", "") or ""
-        if isinstance(review, str) and _DUPE_PATTERN.search(review):
-            continue
-        filtered.append(item)
-        if len(filtered) >= MAX_ITEMS_PER_ACTRESS:
-            break
-    return filtered
+# filter_items は filters.py からインポート済み
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +577,7 @@ def _cb_batch_add():
             names = ", ".join(c[0] for c in collected)
             st.session_state.add_success = names
             st.session_state.search_results = {}
+            st.session_state.pending_names = ""
         except Exception as e:
             st.session_state.search_error = f"追加失敗: {e}"
 
@@ -687,7 +654,7 @@ with st.sidebar:
         st.error(st.session_state.search_error)
         st.session_state.search_error = ""
 
-    with st.form("multi_search_form", clear_on_submit=False):
+    with st.form("multi_search_form", clear_on_submit=True):
         query = st.text_area(
             "女優名（カンマ区切り）",
             placeholder="深田えいみ, 三上悠亜, 橋本ありな",
@@ -1045,6 +1012,68 @@ else:
     else:
         st.session_state.pop("extra_groups", None)
 
+        # --- 🔥 新着ピックアップ (全女優から最新10本) ---
+        all_latest: list[dict] = []
+        for g in group_order:
+            for member in groups[g]:
+                actress = member["row"]
+                name = actress["name"]
+                actress_id = str(actress["actress_id"])
+                try:
+                    raw = search_items_by_actress(actress_id, hits=30)
+                    good = filter_items(raw)
+                    for it in good:
+                        it["_actress_name"] = name
+                    all_latest.extend(good)
+                except Exception:
+                    pass
+
+        # 日付降順ソート → content_id で重複除去 → 先頭10件
+        all_latest.sort(key=lambda x: x.get("date", ""), reverse=True)
+        seen_cids: set[str] = set()
+        unique_latest: list[dict] = []
+        for it in all_latest:
+            cid = it.get("content_id", "")
+            if cid and cid not in seen_cids:
+                seen_cids.add(cid)
+                unique_latest.append(it)
+            if len(unique_latest) >= 10:
+                break
+
+        if unique_latest:
+            st.markdown(
+                '<h3 style="color:#f0f0f0;margin-bottom:4px;">'
+                '🔥 新着ピックアップ</h3>',
+                unsafe_allow_html=True,
+            )
+            st.caption("登録女優の最新作品")
+            # 横スクロールカード (女優名付き)
+            cards = []
+            for item in unique_latest:
+                title = item.get("title", "タイトル不明")
+                date = item.get("date", "")[:10]
+                cid = item.get("content_id", "")
+                url = make_item_url(cid) if cid else "#"
+                img = (
+                    item.get("imageURL", {}).get("large", "")
+                    or item.get("imageURL", {}).get("small", "")
+                )
+                aname = item.get("_actress_name", "")
+                img_tag = f'<img src="{img}" loading="lazy">' if img else ""
+                cards.append(
+                    f'<a class="icard" href="{url}" target="_blank">'
+                    f"  {img_tag}"
+                    f'  <div class="ttl">{title}</div>'
+                    f'  <div class="dt">📅 {date}　👤 {aname}</div>'
+                    f"</a>"
+                )
+            st.markdown(
+                '<div class="hscroll">' + "".join(cards) + "</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("---")
+
+        # --- グループ別一覧 ---
         for g in group_order:
             members = groups[g]
             with st.expander(f"📂 {g}（{len(members)}人）", expanded=False):
@@ -1065,3 +1094,4 @@ else:
 
                     render_hscroll(items)
                     st.markdown("---")
+
