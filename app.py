@@ -55,12 +55,10 @@ st.markdown(
         color: var(--txt) !important;
     }
     [data-testid="stHeader"] { background: transparent !important; }
-    /* Streamlit デプロイメニュー (Share/Star) を非表示 */
-    [data-testid="stToolbar"],
+    /* Streamlit デプロイメニュー (Share/Star) を非表示 (サイドバーボタンは残す) */
     [data-testid="stDecoration"],
-    #MainMenu,
-    header [data-testid="stActionButtonIcon"],
-    .stDeployButton {
+    .stDeployButton,
+    [data-testid="stToolbar"] [data-testid="stToolbarActions"] {
         display: none !important;
     }
     .block-container { max-width: 100%; padding: 1rem 2rem; }
@@ -278,8 +276,9 @@ st.markdown(
     .hscroll {
         display: flex;
         overflow-x: auto;
+        overflow-y: visible;
         gap: 12px;
-        padding: 4px 0 16px;
+        padding: 8px 4px 20px;
         -webkit-overflow-scrolling: touch;
         scroll-snap-type: x mandatory;
     }
@@ -296,9 +295,12 @@ st.markdown(
         scroll-snap-align: start;
         text-decoration: none;
         color: inherit;
-        transition: transform 0.15s ease;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
-    .icard:hover { transform: scale(1.04); }
+    .icard:hover {
+        transform: translateY(-4px);
+        filter: brightness(1.1);
+    }
     .icard img {
         width: 150px;
         height: 210px;
@@ -378,7 +380,6 @@ for key, default in {
     "search_error": "",
     "add_success": "",
     "edit_mode": False,
-    "items_cache": {},
     "pending_names": "",        # 検索待ち名前テキスト
 }.items():
     if key not in st.session_state:
@@ -435,12 +436,9 @@ def search_actress_api(keyword: str, hits: int = 10):
     return resp.json().get("result", {}).get("actress", [])
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def search_items_by_actress(actress_id: str, hits: int = 30):
-    """API検索結果をセッションキャッシュし、rerun時の再取得を防ぐ。"""
-    cache = st.session_state.items_cache
-    if actress_id in cache:
-        return cache[actress_id]
-
+    """API検索結果を10分間キャッシュ。ページリロードでも再取得しない。"""
     params = {
         "api_id": API_ID,
         "affiliate_id": AFFILIATE_ID,
@@ -455,9 +453,7 @@ def search_items_by_actress(actress_id: str, hits: int = 30):
     }
     resp = requests.get(DMM_ITEM_ENDPOINT, params=params, timeout=15)
     resp.raise_for_status()
-    items = resp.json().get("result", {}).get("items", [])
-    cache[actress_id] = items
-    return items
+    return resp.json().get("result", {}).get("items", [])
 
 
 def make_item_url(content_id: str) -> str:
@@ -592,7 +588,7 @@ def _cb_batch_add():
 
 def _cb_swap(df, idx_a, idx_b):
     swap_actress_order(df, idx_a, idx_b)
-    st.session_state.items_cache = {}
+    search_items_by_actress.clear()
 
 
 # ---------------------------------------------------------------------------
