@@ -8,11 +8,13 @@ AV Monitor - 新着チェック Web アプリ
 """
 
 import re
+import uuid
 import streamlit as st
 import requests
 import gspread
 import pandas as pd
 import urllib.parse
+import feedparser
 from streamlit_sortables import sort_items
 from oauth2client.service_account import ServiceAccountCredentials
 from filters import filter_items
@@ -464,6 +466,67 @@ def make_item_url(content_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# NHブログ RSS ヘルパー
+# ---------------------------------------------------------------------------
+NH_BLOG_SEARCH_URL = "https://main.av-somurie.xyz/?s={query}&feed=rss2"
+NH_BLOG_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _fetch_rss(url: str) -> feedparser.FeedParserDict:
+    """User-Agent 付きで RSS を取得し feedparser でパースして返す。"""
+    resp = requests.get(url, headers={"User-Agent": NH_BLOG_UA}, timeout=15)
+    resp.raise_for_status()
+    return feedparser.parse(resp.content)
+
+
+def search_nh_blog(actress_name: str) -> list[dict]:
+    """NHブログ RSS を検索し、該当記事があるか確認する。
+    見つかった記事リスト [{title, link, thumbnail, published}] を返す。"""
+    url = NH_BLOG_SEARCH_URL.format(query=urllib.parse.quote(actress_name))
+    feed = _fetch_rss(url)
+    results = []
+    for entry in feed.entries:
+        thumb = ""
+        # メディアサムネイルを探す
+        for link in getattr(entry, "media_thumbnail", []):
+            thumb = link.get("url", "")
+            break
+        if not thumb:
+            # content 内の最初の <img> src を抽出
+            for c in getattr(entry, "content", []):
+                m = re.search(r'<img[^>]+src=["\']([^"\']+)', c.get("value", ""))
+                if m:
+                    thumb = m.group(1)
+                    break
+        if not thumb:
+            summary = getattr(entry, "summary", "")
+            m = re.search(r'<img[^>]+src=["\']([^"\']+)', summary)
+            if m:
+                thumb = m.group(1)
+        results.append({
+            "title": entry.get("title", "タイトル不明"),
+            "link": entry.get("link", ""),
+            "thumbnail": thumb,
+            "published": entry.get("published", ""),
+        })
+    return results
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_nh_blog_items(actress_name: str, max_items: int = 5) -> list[dict]:
+    """NHブログ RSS から最新記事を取得（1 時間キャッシュ）。"""
+    try:
+        items = search_nh_blog(actress_name)
+        return items[:max_items]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # スプシ操作ヘルパー
 # ---------------------------------------------------------------------------
 def get_all_actresses(force_refresh: bool = False) -> pd.DataFrame:
@@ -472,12 +535,17 @@ def get_all_actresses(force_refresh: bool = False) -> pd.DataFrame:
     ws = get_sheet("actresses")
     records = ws.get_all_records()
     if not records:
-        df = pd.DataFrame(columns=["name", "actress_id", "image_url", "group"])
+        df = pd.DataFrame(columns=["name", "actress_id", "image_url", "group", "source"])
     else:
         df = pd.DataFrame(records)
         if "group" not in df.columns:
             df["group"] = ""
         df["group"] = df["group"].fillna("").astype(str)
+        # source 列のフォールバック: 空欄は FANZA として扱う
+        if "source" not in df.columns:
+            df["source"] = "FANZA"
+        df["source"] = df["source"].fillna("").astype(str)
+        df["source"] = df["source"].replace("", "FANZA")
     st.session_state.df_actresses_cache = df
     return df
 
@@ -487,9 +555,10 @@ def _invalidate_actress_cache():
     _get_gspread_client.clear()
 
 
-def add_actresses_batch(actress_list: list[tuple[str, str, str]]):
+def add_actresses_batch(actress_list: list[tuple[str, str, str, str]]):
+    """actress_list: [(name, actress_id, image_url, source), ...]"""
     ws = get_sheet("actresses")
-    rows = [[name, str(aid), img, ""] for name, aid, img in actress_list]
+    rows = [[name, str(aid), img, "", source] for name, aid, img, source in actress_list]
     ws.append_rows(rows)
     _invalidate_actress_cache()
 
@@ -507,9 +576,13 @@ def delete_actress(actress_id: str):
 def _rebuild_sheet(df: pd.DataFrame):
     ws = get_sheet("actresses")
     ws.clear()
-    ws.append_row(["name", "actress_id", "image_url", "group"])
+    ws.append_row(["name", "actress_id", "image_url", "group", "source"])
     if not df.empty:
-        rows = df[["name", "actress_id", "image_url", "group"]].values.tolist()
+        cols = ["name", "actress_id", "image_url", "group", "source"]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = "FANZA" if c == "source" else ""
+        rows = df[cols].values.tolist()
         ws.append_rows(rows)
     _invalidate_actress_cache()
 
@@ -529,15 +602,17 @@ def save_actress_order(ordered_groups: list[dict]):
             aid = label.rsplit("[", 1)[-1].rstrip("]").strip()
             if aid in id_map:
                 r = id_map[aid]
+                src = str(r.get("source", "")) or "FANZA"
                 new_rows.append([
                     r.get("name", ""),
                     str(r.get("actress_id", "")),
                     r.get("image_url", ""),
                     actual_group,
+                    src,
                 ])
 
     ws.clear()
-    ws.append_row(["name", "actress_id", "image_url", "group"])
+    ws.append_row(["name", "actress_id", "image_url", "group", "source"])
     if new_rows:
         ws.append_rows(new_rows)
     _invalidate_actress_cache()
@@ -565,7 +640,7 @@ def _cb_batch_add():
                 act.get("imageURL", {}).get("small", "")
                 or act.get("imageURL", {}).get("large", "")
             )
-            collected.append((act.get("name", name), aid, img))
+            collected.append((act.get("name", name), aid, img, "FANZA"))
         else:
             for act in results:
                 aid = str(act.get("id", ""))
@@ -574,7 +649,7 @@ def _cb_batch_add():
                         act.get("imageURL", {}).get("small", "")
                         or act.get("imageURL", {}).get("large", "")
                     )
-                    collected.append((act.get("name", name), aid, img))
+                    collected.append((act.get("name", name), aid, img, "FANZA"))
     if collected:
         try:
             add_actresses_batch(collected)
@@ -643,6 +718,33 @@ def render_hscroll(items: list[dict]):
     )
 
 
+def render_hscroll_blog(items: list[dict]):
+    """NHブログ記事をカード型で横スクロール表示する。"""
+    if not items:
+        st.caption("記事なし")
+        return
+
+    cards = []
+    for item in items:
+        title = item.get("title", "タイトル不明")
+        url = item.get("link", "#")
+        thumb = item.get("thumbnail", "")
+        pub = item.get("published", "")[:16]
+        img_tag = f'<img src="{thumb}" loading="lazy">' if thumb else ""
+        cards.append(
+            f'<a class="icard" href="{url}" target="_blank">'
+            f"  {img_tag}"
+            f'  <div class="ttl">{title}</div>'
+            f'  <div class="dt">📅 {pub}</div>'
+            f"</a>"
+        )
+
+    st.markdown(
+        '<div class="hscroll">' + "".join(cards) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # サイドバー: 女優一括検索 & 追加
 # ---------------------------------------------------------------------------
@@ -658,6 +760,14 @@ with st.sidebar:
         st.error(st.session_state.search_error)
         st.session_state.search_error = ""
 
+    # 情報元トグル
+    search_source = st.radio(
+        "情報元",
+        ["FANZA公式", "NHブログ"],
+        horizontal=True,
+        key="search_source_radio",
+    )
+
     with st.form("multi_search_form", clear_on_submit=True):
         query = st.text_area(
             "女優名（カンマ区切り）",
@@ -668,25 +778,46 @@ with st.sidebar:
 
     if submitted and query:
         names = parse_names(query)
-        old_results = dict(st.session_state.search_results)
-        errors = []
-        for name in names:
-            if name in old_results:
-                continue  # 既に検索済み
-            try:
-                found = search_actress_api(name, hits=5)
-                if found:
-                    old_results[name] = found
-                else:
-                    errors.append(f"「{name}」: 見つかりません")
-            except Exception as e:
-                errors.append(f"「{name}」: {e}")
-        st.session_state.search_results = old_results
-        if errors:
-            st.session_state.search_error = " / ".join(errors)
+        if search_source == "FANZA公式":
+            # --- FANZA 検索 (既存ロジック) ---
+            old_results = dict(st.session_state.search_results)
+            errors = []
+            for name in names:
+                if name in old_results:
+                    continue
+                try:
+                    found = search_actress_api(name, hits=5)
+                    if found:
+                        old_results[name] = found
+                    else:
+                        errors.append(f"「{name}」: 見つかりません")
+                except Exception as e:
+                    errors.append(f"「{name}」: {e}")
+            st.session_state.search_results = old_results
+            if errors:
+                st.session_state.search_error = " / ".join(errors)
+        else:
+            # --- NHブログ検索 ---
+            errors = []
+            added_names = []
+            for name in names:
+                try:
+                    articles = search_nh_blog(name)
+                    if articles:
+                        aid = f"nhb-{uuid.uuid4().hex[:12]}"
+                        add_actresses_batch([(name, aid, "", "NH_BLOG")])
+                        added_names.append(name)
+                    else:
+                        errors.append(f"「{name}」: ブログ記事が見つかりません")
+                except Exception as e:
+                    errors.append(f"「{name}」: {e}")
+            if added_names:
+                st.session_state.add_success = ", ".join(added_names)
+            if errors:
+                st.session_state.search_error = " / ".join(errors)
         st.rerun()
 
-    # --- 蓄積された結果表示 ---
+    # --- 蓄積された結果表示 (FANZA検索結果) ---
     if st.session_state.search_results:
         all_results = st.session_state.search_results
         st.markdown(f"**検索結果: {len(all_results)}名**")
@@ -851,15 +982,17 @@ else:
                     aid = str(m["row"]["actress_id"])
                     if aid in id_map:
                         ir = id_map[aid]
+                        src = str(ir.get("source", "")) or "FANZA"
                         new_rows.append([
                             ir.get("name", ""),
                             str(ir.get("actress_id", "")),
                             ir.get("image_url", ""),
                             actual_g,
+                            src,
                         ])
 
             ws.clear()
-            ws.append_row(["name", "actress_id", "image_url", "group"])
+            ws.append_row(["name", "actress_id", "image_url", "group", "source"])
             if new_rows:
                 ws.append_rows(new_rows)
             _invalidate_actress_cache()
@@ -1017,19 +1150,26 @@ else:
         st.session_state.pop("extra_groups", None)
 
         # --- 全女優のデータを1回で取得＆フィルタ (高速化) ---
-        filtered_cache: dict[str, list[dict]] = {}
+        filtered_cache: dict[str, list[dict]] = {}      # FANZA 用
+        blog_cache: dict[str, list[dict]] = {}           # NHブログ用
         for g in group_order:
             for member in groups[g]:
                 actress_id = str(member["row"]["actress_id"])
-                if actress_id in filtered_cache:
-                    continue
-                try:
-                    raw = search_items_by_actress(actress_id, hits=30)
-                    filtered_cache[actress_id] = filter_items(
-                        raw, require_sample_video=True,
-                    )
-                except Exception:
-                    filtered_cache[actress_id] = []
+                source = str(member["row"].get("source", "")) or "FANZA"
+                if source == "NH_BLOG":
+                    if actress_id not in blog_cache:
+                        blog_cache[actress_id] = fetch_nh_blog_items(
+                            member["row"]["name"]
+                        )
+                else:
+                    if actress_id not in filtered_cache:
+                        try:
+                            raw = search_items_by_actress(actress_id, hits=30)
+                            filtered_cache[actress_id] = filter_items(
+                                raw, require_sample_video=True,
+                            )
+                        except Exception:
+                            filtered_cache[actress_id] = []
 
         # --- 🔥 新着ピックアップ (全女優から最新10本) ---
         all_latest: list[dict] = []
@@ -1037,19 +1177,32 @@ else:
             for member in groups[g]:
                 actress = member["row"]
                 actress_id = str(actress["actress_id"])
-                for it in filtered_cache.get(actress_id, []):
-                    # 一時属性を別 dict にして元データを汚さない
-                    entry = {**it, "_actress_name": actress["name"]}
-                    all_latest.append(entry)
+                source = str(actress.get("source", "")) or "FANZA"
+                if source == "NH_BLOG":
+                    for it in blog_cache.get(actress_id, []):
+                        entry = {
+                            "title": it.get("title", ""),
+                            "date": it.get("published", ""),
+                            "content_id": "",
+                            "_link": it.get("link", ""),
+                            "_thumbnail": it.get("thumbnail", ""),
+                            "_actress_name": actress["name"],
+                            "_source": "NH_BLOG",
+                        }
+                        all_latest.append(entry)
+                else:
+                    for it in filtered_cache.get(actress_id, []):
+                        entry = {**it, "_actress_name": actress["name"], "_source": "FANZA"}
+                        all_latest.append(entry)
 
-        # 日付降順ソート → content_id で重複除去 → 先頭10件
+        # 日付降順ソート → content_id / link で重複除去 → 先頭10件
         all_latest.sort(key=lambda x: x.get("date", ""), reverse=True)
-        seen_cids: set[str] = set()
+        seen_keys: set[str] = set()
         unique_latest: list[dict] = []
         for it in all_latest:
-            cid = it.get("content_id", "")
-            if cid and cid not in seen_cids:
-                seen_cids.add(cid)
+            key = it.get("content_id", "") or it.get("_link", "")
+            if key and key not in seen_keys:
+                seen_keys.add(key)
                 unique_latest.append(it)
             if len(unique_latest) >= 10:
                 break
@@ -1064,14 +1217,19 @@ else:
             cards = []
             for item in unique_latest:
                 title = item.get("title", "タイトル不明")
-                date = item.get("date", "")[:10]
-                cid = item.get("content_id", "")
-                url = make_item_url(cid) if cid else "#"
-                img = (
-                    item.get("imageURL", {}).get("large", "")
-                    or item.get("imageURL", {}).get("small", "")
-                )
                 aname = item.get("_actress_name", "")
+                if item.get("_source") == "NH_BLOG":
+                    date = item.get("date", "")[:16]
+                    url = item.get("_link", "#")
+                    img = item.get("_thumbnail", "")
+                else:
+                    date = item.get("date", "")[:10]
+                    cid = item.get("content_id", "")
+                    url = make_item_url(cid) if cid else "#"
+                    img = (
+                        item.get("imageURL", {}).get("large", "")
+                        or item.get("imageURL", {}).get("small", "")
+                    )
                 img_tag = f'<img src="{img}" loading="lazy">' if img else ""
                 cards.append(
                     f'<a class="icard" href="{url}" target="_blank">'
@@ -1095,10 +1253,15 @@ else:
                     name = actress["name"]
                     actress_id = str(actress["actress_id"])
                     face_url = str(actress.get("image_url", ""))
+                    source = str(actress.get("source", "")) or "FANZA"
 
                     render_actress_header(name, face_url)
-                    items = filtered_cache.get(actress_id, [])
-                    render_hscroll(items)
+                    if source == "NH_BLOG":
+                        items = blog_cache.get(actress_id, [])
+                        render_hscroll_blog(items)
+                    else:
+                        items = filtered_cache.get(actress_id, [])
+                        render_hscroll(items)
                     st.markdown("---")
 
 
