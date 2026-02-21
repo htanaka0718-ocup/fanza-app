@@ -15,6 +15,7 @@ import gspread
 import pandas as pd
 import urllib.parse
 import feedparser
+import time
 from streamlit_sortables import sort_items
 from oauth2client.service_account import ServiceAccountCredentials
 from filters import filter_items
@@ -379,6 +380,7 @@ MAX_ITEMS_PER_ACTRESS = 5
 # ---------------------------------------------------------------------------
 for key, default in {
     "search_results": {},       # name -> [actress dicts]
+    "nh_search_results": {},    # name -> {articles, face_img}
     "search_error": "",
     "add_success": "",
     "edit_mode": False,
@@ -466,9 +468,10 @@ def make_item_url(content_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# NHブログ RSS ヘルパー
+# NHブログ スクレイピングヘルパー
 # ---------------------------------------------------------------------------
-NH_BLOG_SEARCH_URL = "https://main.av-somurie.xyz/?s={query}&feed=rss2"
+NH_BLOG_BASE = "https://main.av-somurie.xyz"
+NH_BLOG_SEARCH_URL = NH_BLOG_BASE + "/?s={query}&feed=rss2"
 NH_BLOG_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -476,54 +479,176 @@ NH_BLOG_UA = (
 )
 
 
+def _nh_get(url: str) -> str:
+    """User-Agent 付きで GET し、HTMLテキストを返す。"""
+    resp = requests.get(url, headers={"User-Agent": NH_BLOG_UA}, timeout=60)
+    resp.raise_for_status()
+    return resp.text
+
+
 def _fetch_rss(url: str) -> feedparser.FeedParserDict:
     """User-Agent 付きで RSS を取得し feedparser でパースして返す。"""
-    resp = requests.get(url, headers={"User-Agent": NH_BLOG_UA}, timeout=15)
+    resp = requests.get(url, headers={"User-Agent": NH_BLOG_UA}, timeout=30)
     resp.raise_for_status()
     return feedparser.parse(resp.content)
 
 
-def search_nh_blog(actress_name: str) -> list[dict]:
-    """NHブログ RSS を検索し、該当記事があるか確認する。
-    見つかった記事リスト [{title, link, thumbnail, published}] を返す。"""
+def search_nh_blog(actress_name: str) -> dict:
+    """NHブログを検索し、女優のカテゴリパス・記事数を返す。
+    戻り値: {category_path, articles: [{title, link, published}], count}
+    category_path が空の場合は該当なし。"""
     url = NH_BLOG_SEARCH_URL.format(query=urllib.parse.quote(actress_name))
     feed = _fetch_rss(url)
-    results = []
+
+    # 記事リンクからカテゴリパスを逆算
+    # 例: https://main.av-somurie.xyz/tagyou/takanashi_kanon/post-57648/
+    #   → category_path = "tagyou/takanashi_kanon"
+    category_path = ""
+    articles = []
     for entry in feed.entries:
-        thumb = ""
-        # メディアサムネイルを探す
-        for link in getattr(entry, "media_thumbnail", []):
-            thumb = link.get("url", "")
-            break
-        if not thumb:
-            # content 内の最初の <img> src を抽出
-            for c in getattr(entry, "content", []):
-                m = re.search(r'<img[^>]+src=["\']([^"\']+)', c.get("value", ""))
-                if m:
-                    thumb = m.group(1)
-                    break
-        if not thumb:
-            summary = getattr(entry, "summary", "")
-            m = re.search(r'<img[^>]+src=["\']([^"\']+)', summary)
+        link = entry.get("link", "")
+        title = entry.get("title", "")
+        published = entry.get("published", "")
+        # /actress_search/ は女優一覧ページなので除外
+        if "/actress_search/" in link:
+            continue
+        
+        # 記事リンクからカテゴリパスを抽出
+        # 例: https://main.av-somurie.xyz/tagyou/takanashi_kanon/post-57648/
+        m = re.match(r"https?://main\.av-somurie\.xyz/([\w]+/[\w]+)/post-\d+/?", link)
+        if m:
+            path = m.group(1)
+            # URLのパスに、検索した女優名のローマ字読みなどが入っているか完全な一致判定は難しいが、
+            # tagyou/takanashi_kanon のようなパスになっているはず。
+            # 他の女優(nanami等)の単なる共演記事であればカテゴリパスが異なる。
+            # よって最初の記事のカテゴリパスをその女優の専用カテゴリパスと見なす。
+            # もしRSSの「カテゴリー」タグ等の情報で判別できるならそれが最善だが、
+            # 現状は1番目に見つかった実際のカテゴリパスを信じて、それ以外は弾く。
+            if not category_path:
+                category_path = path
+
+            # カテゴリパスが最初に確定したものと一致する記事だけを採用（別女優のカテゴリ記事を除外）
+            if path == category_path:
+                articles.append({
+                    "title": title,
+                    "link": link,
+                    "published": published,
+                })
+
+    # さらに厳密に、取得した articles が本当にその女優向けか検証が必要なら行うが、
+    # 基本的に名前検索でトップに出てくる一番多いカテゴリを採用するロジックにする
+    if articles:
+        # カテゴリ一覧の抽出とカウント
+        path_counts = {}
+        for entry in feed.entries:
+            link = entry.get("link", "")
+            if "/actress_search/" in link: continue
+            m = re.match(r"https?://main\.av-somurie\.xyz/([\w]+/[\w]+)/post-\d+/?", link)
             if m:
-                thumb = m.group(1)
-        results.append({
-            "title": entry.get("title", "タイトル不明"),
-            "link": entry.get("link", ""),
-            "thumbnail": thumb,
-            "published": entry.get("published", ""),
-        })
-    return results
+                p = m.group(1)
+                path_counts[p] = path_counts.get(p, 0) + 1
+                
+        # 一番出現頻度が高いカテゴリパスを正解とする
+        if path_counts:
+            best_path = max(path_counts, key=path_counts.get)
+            category_path = best_path
+            
+            # best_path の記事だけ再収集
+            articles = []
+            for entry in feed.entries:
+                link = entry.get("link", "")
+                title = entry.get("title", "")
+                published = entry.get("published", "")
+                m = re.match(r"https?://main\.av-somurie\.xyz/([\w]+/[\w]+)/post-\d+/?", link)
+                if m and m.group(1) == best_path:
+                    articles.append({
+                        "title": title,
+                        "link": link,
+                        "published": published,
+                    })
+
+    return {
+        "category_path": category_path,
+        "articles": articles,
+        "count": len(articles),
+    }
+
+
+def _scrape_nh_face_img(category_path: str) -> str:
+    """カテゴリページHTMLから顔画像URLのみを取得する。"""
+    cat_url = f"{NH_BLOG_BASE}/category/{category_path}/"
+    html = _nh_get(cat_url)
+    profile_m = re.search(
+        r'<article[^>]*class=["\'][^"\']*category-content[^"\']*["\'][^>]*>(.*?)</article>',
+        html, re.DOTALL,
+    )
+    if profile_m:
+        img_m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', profile_m.group(1))
+        if img_m:
+            return img_m.group(1)
+    return ""
+
+
+def _fetch_nh_category_rss(category_path: str, max_items: int = 5) -> list[dict]:
+    """カテゴリ RSS から最新作品を取得する（軽量・高速）。
+    戻り値: [{title, link, thumbnail, published}]"""
+    rss_url = f"{NH_BLOG_BASE}/category/{category_path}/?feed=rss2"
+    feed = _fetch_rss(rss_url)
+    works = []
+    for entry in feed.entries[:max_items]:
+        title = entry.get("title", "")
+        link = entry.get("link", "")
+        
+        # 投稿日時を FANZA と同じ YYYY-MM-DD HH:MM:SS 形式に揃える
+        published_parsed = entry.get("published_parsed")
+        if published_parsed:
+            published = time.strftime('%Y-%m-%d %H:%M:%S', published_parsed)
+        else:
+            published = entry.get("published", "")
+
+        # content:encoded や summary から画像を抽出
+        content = ""
+        if "content" in entry and entry.content:
+            content = entry.content[0].get("value", "")
+        if not content:
+            content = entry.get("summary", "")
+            
+        imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', content)
+        
+        thumb = ""
+        # 1. pl.(jpg|webp|png) や top.jpg (パッケージ画像) を優先的に探す
+        for img in imgs:
+            if re.search(r'(?:pl|top)\.(?:jpg|jpeg|png|webp)', img, re.IGNORECASE):
+                thumb = img
+                break
+                
+        # 2. なければ、サンプル画像 (jp-X.jpg, -X.jpg, _X.jpg) および バナー画像 以外を探す
+        if not thumb:
+            for img in imgs:
+                if not re.search(r'(?:jp-\d+|-\d+|_\d+)\.(?:jpg|jpeg|png|webp)|bannar', img, re.IGNORECASE):
+                    thumb = img
+                    break
+                    
+        # 3. それでもなければ最初の画像
+        if not thumb and imgs:
+            thumb = imgs[0]
+
+        if title:
+            works.append({
+                "title": title,
+                "link": link,
+                "thumbnail": thumb,
+                "published": published,
+            })
+    return works
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_nh_blog_items(actress_name: str, max_items: int = 5) -> list[dict]:
-    """NHブログ RSS から最新記事を取得（1 時間キャッシュ）。"""
-    try:
-        items = search_nh_blog(actress_name)
-        return items[:max_items]
-    except Exception:
-        return []
+def fetch_nh_blog_items(category_path: str, max_items: int = 5) -> list[dict]:
+    """NHブログ カテゴリRSS から最新作品を取得（1 時間キャッシュ）。
+    戻り値: [{title, link, thumbnail, published}]
+    例外時はキャッシュせず次回リトライ可能。"""
+    return _fetch_nh_category_rss(category_path, max_items)
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +658,10 @@ def get_all_actresses(force_refresh: bool = False) -> pd.DataFrame:
     if not force_refresh and "df_actresses_cache" in st.session_state:
         return st.session_state.df_actresses_cache
     ws = get_sheet("actresses")
+    # ヘッダーに source 列がなければ自動追加
+    header = ws.row_values(1)
+    if "source" not in header:
+        ws.update_cell(1, len(header) + 1, "source")
     records = ws.get_all_records()
     if not records:
         df = pd.DataFrame(columns=["name", "actress_id", "image_url", "group", "source"])
@@ -719,9 +848,9 @@ def render_hscroll(items: list[dict]):
 
 
 def render_hscroll_blog(items: list[dict]):
-    """NHブログ記事をカード型で横スクロール表示する。"""
+    """NHブログ作品をカード型で横スクロール表示する。"""
     if not items:
-        st.caption("記事なし")
+        st.caption("作品なし")
         return
 
     cards = []
@@ -729,13 +858,13 @@ def render_hscroll_blog(items: list[dict]):
         title = item.get("title", "タイトル不明")
         url = item.get("link", "#")
         thumb = item.get("thumbnail", "")
-        pub = item.get("published", "")[:16]
+        date = item.get("published", "")[:10]
         img_tag = f'<img src="{thumb}" loading="lazy">' if thumb else ""
         cards.append(
             f'<a class="icard" href="{url}" target="_blank">'
             f"  {img_tag}"
             f'  <div class="ttl">{title}</div>'
-            f'  <div class="dt">📅 {pub}</div>'
+            f'  <div class="dt">📅 {date}</div>'
             f"</a>"
         )
 
@@ -763,7 +892,7 @@ with st.sidebar:
     # 情報元トグル
     search_source = st.radio(
         "情報元",
-        ["FANZA公式", "NHブログ"],
+        ["FANZA公式", "NH"],
         horizontal=True,
         key="search_source_radio",
     )
@@ -797,22 +926,33 @@ with st.sidebar:
             if errors:
                 st.session_state.search_error = " / ".join(errors)
         else:
-            # --- NHブログ検索 ---
+            # --- NH検索 (プレビュー→選択方式) ---
+            old_nh = dict(st.session_state.nh_search_results)
             errors = []
-            added_names = []
             for name in names:
+                if name in old_nh:
+                    continue
                 try:
-                    articles = search_nh_blog(name)
-                    if articles:
-                        aid = f"nhb-{uuid.uuid4().hex[:12]}"
-                        add_actresses_batch([(name, aid, "", "NH_BLOG")])
-                        added_names.append(name)
+                    result = search_nh_blog(name)
+                    cat_path = result.get("category_path", "")
+                    articles = result.get("articles", [])
+                    if cat_path and articles:
+                        # カテゴリページから顔画像を取得
+                        try:
+                            face_img = _scrape_nh_face_img(cat_path)
+                        except Exception:
+                            face_img = ""
+                        old_nh[name] = {
+                            "category_path": cat_path,
+                            "articles": articles,
+                            "face_img": face_img,
+                            "count": len(articles),
+                        }
                     else:
-                        errors.append(f"「{name}」: ブログ記事が見つかりません")
+                        errors.append(f"「{name}」: 記事が見つかりません")
                 except Exception as e:
                     errors.append(f"「{name}」: {e}")
-            if added_names:
-                st.session_state.add_success = ", ".join(added_names)
+            st.session_state.nh_search_results = old_nh
             if errors:
                 st.session_state.search_error = " / ".join(errors)
         st.rerun()
@@ -820,7 +960,7 @@ with st.sidebar:
     # --- 蓄積された結果表示 (FANZA検索結果) ---
     if st.session_state.search_results:
         all_results = st.session_state.search_results
-        st.markdown(f"**検索結果: {len(all_results)}名**")
+        st.markdown(f"**🔍 FANZA検索結果: {len(all_results)}名**")
 
         st.button(
             "✅ まとめて登録",
@@ -877,6 +1017,56 @@ with st.sidebar:
                             f"ID:{aid}</span>",
                             unsafe_allow_html=True,
                         )
+            st.markdown("---")
+
+    # --- 蓄積された結果表示 (NH検索結果) ---
+    if st.session_state.nh_search_results:
+        nh_results = st.session_state.nh_search_results
+        st.markdown(f"**🔍 NH検索結果: {len(nh_results)}名**")
+
+        def _cb_nh_batch_add():
+            """NH検索結果から全女優を一括登録する。"""
+            collected = []
+            for name, data in st.session_state.nh_search_results.items():
+                # actress_id にカテゴリパスを保存 (例: tagyou/takanashi_kanon)
+                aid = data.get("category_path", f"nhb-{uuid.uuid4().hex[:12]}")
+                face_img = data.get("face_img", "")
+                collected.append((name, aid, face_img, "NH_BLOG"))
+            if collected:
+                try:
+                    add_actresses_batch(collected)
+                    names_str = ", ".join(c[0] for c in collected)
+                    st.session_state.add_success = names_str
+                    st.session_state.nh_search_results = {}
+                except Exception as e:
+                    st.session_state.search_error = f"追加失敗: {e}"
+
+        st.button(
+            "✅ まとめて登録",
+            use_container_width=True, type="primary",
+            on_click=_cb_nh_batch_add, key="nh_batch_add_btn",
+        )
+
+        if st.button("🗑️ NH検索結果をクリア", use_container_width=True,
+                     key="nh_clear_btn"):
+            st.session_state.nh_search_results = {}
+            st.rerun()
+
+        for search_name, data in nh_results.items():
+            face_img = data.get("face_img", "")
+            count = data.get("count", 0)
+            r1, r2 = st.columns([1, 3])
+            with r1:
+                if face_img:
+                    st.image(face_img, width=45)
+            with r2:
+                st.markdown(
+                    f"<span style='color:#f0f0f0;font-weight:600'>"
+                    f"{search_name}</span> "
+                    f"<span style='color:#ff4d8d;font-size:0.75rem'>"
+                    f"({count}件の記事)</span> ✅",
+                    unsafe_allow_html=True,
+                )
             st.markdown("---")
 
 # ---------------------------------------------------------------------------
@@ -1137,7 +1327,7 @@ else:
                             unsafe_allow_html=True,
                         )
                     with c2:
-                        if st.button("✕", key=f"del_{row['actress_id']}",
+                        if st.button("✕", key=f"del_{row_i}_{row['actress_id']}",
                                      use_container_width=True):
                             delete_actress(str(row["actress_id"]))
                             st.success(f"{row['name']} を削除しました。")
@@ -1151,16 +1341,17 @@ else:
 
         # --- 全女優のデータを1回で取得＆フィルタ (高速化) ---
         filtered_cache: dict[str, list[dict]] = {}      # FANZA 用
-        blog_cache: dict[str, list[dict]] = {}           # NHブログ用
+        blog_cache: dict[str, list[dict]] = {}            # NHブログ用
         for g in group_order:
             for member in groups[g]:
-                actress_id = str(member["row"]["actress_id"])
+                actress_id = str(member["row"]["actress_id"]).replace(".0", "").strip()
                 source = str(member["row"].get("source", "")) or "FANZA"
                 if source == "NH_BLOG":
                     if actress_id not in blog_cache:
-                        blog_cache[actress_id] = fetch_nh_blog_items(
-                            member["row"]["name"]
-                        )
+                        try:
+                            blog_cache[actress_id] = fetch_nh_blog_items(actress_id)
+                        except Exception:
+                            blog_cache[actress_id] = []
                 else:
                     if actress_id not in filtered_cache:
                         try:
@@ -1170,13 +1361,14 @@ else:
                             )
                         except Exception:
                             filtered_cache[actress_id] = []
-
+                            
         # --- 🔥 新着ピックアップ (全女優から最新10本) ---
         all_latest: list[dict] = []
+        nh_latest: list[dict] = []
         for g in group_order:
             for member in groups[g]:
                 actress = member["row"]
-                actress_id = str(actress["actress_id"])
+                actress_id = str(actress["actress_id"]).replace(".0", "").strip()
                 source = str(actress.get("source", "")) or "FANZA"
                 if source == "NH_BLOG":
                     for it in blog_cache.get(actress_id, []):
@@ -1189,28 +1381,40 @@ else:
                             "_actress_name": actress["name"],
                             "_source": "NH_BLOG",
                         }
-                        all_latest.append(entry)
+                        nh_latest.append(entry)
                 else:
                     for it in filtered_cache.get(actress_id, []):
                         entry = {**it, "_actress_name": actress["name"], "_source": "FANZA"}
                         all_latest.append(entry)
 
-        # 日付降順ソート → content_id / link で重複除去 → 先頭10件
+        # FANZA の新着ソートと重複除去
         all_latest.sort(key=lambda x: x.get("date", ""), reverse=True)
         seen_keys: set[str] = set()
         unique_latest: list[dict] = []
         for it in all_latest:
-            key = it.get("content_id", "") or it.get("_link", "")
+            key = it.get("content_id", "")
             if key and key not in seen_keys:
                 seen_keys.add(key)
                 unique_latest.append(it)
             if len(unique_latest) >= 10:
                 break
+                
+        # NH の新着ソートと重複除去 (投稿日ベース)
+        nh_latest.sort(key=lambda x: x.get("date", ""), reverse=True)
+        seen_nh_keys: set[str] = set()
+        unique_nh_latest: list[dict] = []
+        for it in nh_latest:
+            key = it.get("_link", "")
+            if key and key not in seen_nh_keys:
+                seen_nh_keys.add(key)
+                unique_nh_latest.append(it)
+            if len(unique_nh_latest) >= 10:
+                break
 
         if unique_latest:
             st.markdown(
                 '<h3 style="color:#f0f0f0;margin-bottom:4px;">'
-                '🔥 新着ピックアップ</h3>',
+                '🔥 新着ピックアップ (FANZA)</h3>',
                 unsafe_allow_html=True,
             )
             st.caption("登録女優の最新作品")
@@ -1218,18 +1422,13 @@ else:
             for item in unique_latest:
                 title = item.get("title", "タイトル不明")
                 aname = item.get("_actress_name", "")
-                if item.get("_source") == "NH_BLOG":
-                    date = item.get("date", "")[:16]
-                    url = item.get("_link", "#")
-                    img = item.get("_thumbnail", "")
-                else:
-                    date = item.get("date", "")[:10]
-                    cid = item.get("content_id", "")
-                    url = make_item_url(cid) if cid else "#"
-                    img = (
-                        item.get("imageURL", {}).get("large", "")
-                        or item.get("imageURL", {}).get("small", "")
-                    )
+                date = item.get("date", "")[:10]
+                cid = item.get("content_id", "")
+                url = make_item_url(cid) if cid else "#"
+                img = (
+                    item.get("imageURL", {}).get("large", "")
+                    or item.get("imageURL", {}).get("small", "")
+                )
                 img_tag = f'<img src="{img}" loading="lazy">' if img else ""
                 cards.append(
                     f'<a class="icard" href="{url}" target="_blank">'
@@ -1243,23 +1442,53 @@ else:
                 unsafe_allow_html=True,
             )
             st.markdown("---")
-
+            
         # --- グループ別一覧 (キャッシュ再利用) ---
         for g in group_order:
+            # NHグループならば、その直前にNH向け新着ピックアップを配置する
+            if g == "NH" and unique_nh_latest:
+                st.markdown(
+                    '<h3 style="color:#f0f0f0;margin-bottom:4px;">'
+                    '🔥 新着ピックアップ (NH)</h3>',
+                    unsafe_allow_html=True,
+                )
+                st.caption("NHブログの最新記事")
+                cards = []
+                for item in unique_nh_latest:
+                    title = item.get("title", "タイトル不明")
+                    aname = item.get("_actress_name", "")
+                    date = item.get("date", "")[:10]
+                    url = item.get("_link", "#")
+                    img = item.get("_thumbnail", "")
+                    img_tag = f'<img src="{img}" loading="lazy">' if img else ""
+                    cards.append(
+                        f'<a class="icard" href="{url}" target="_blank">'
+                        f"  {img_tag}"
+                        f'  <div class="ttl">{title}</div>'
+                        f'  <div class="dt">📅 {date}　👤 {aname}</div>'
+                        f"</a>"
+                    )
+                st.markdown(
+                    '<div class="hscroll">' + "".join(cards) + "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("---")
+
             members = groups[g]
             with st.expander(f"📂 {g}（{len(members)}人）", expanded=False):
                 for i, member in enumerate(members):
                     actress = member["row"]
                     name = actress["name"]
-                    actress_id = str(actress["actress_id"])
+                    actress_id = str(actress["actress_id"]).replace(".0", "").strip()
                     face_url = str(actress.get("image_url", ""))
                     source = str(actress.get("source", "")) or "FANZA"
 
-                    render_actress_header(name, face_url)
                     if source == "NH_BLOG":
+                        render_actress_header(name, face_url)
                         items = blog_cache.get(actress_id, [])
                         render_hscroll_blog(items)
                     else:
+                        render_actress_header(name, face_url)
                         items = filtered_cache.get(actress_id, [])
                         render_hscroll(items)
                     st.markdown("---")

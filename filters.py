@@ -67,13 +67,21 @@ def filter_items(
             continue
 
         if require_sample_video:
-            sample = item.get("sampleMovieURL") or item.get("sampleImageURL")
-            if not sample:
+            sample_movie = item.get("sampleMovieURL")
+            sample_image = item.get("sampleImageURL")
+            # Require either a sample video or at least one sample image
+            if not sample_movie and not sample_image:
                 continue
 
-        # 商品画像がない作品を除外
-        img_urls = item.get("imageURL", {})
-        if not img_urls.get("large") and not img_urls.get("small"):
+        # 商品画像がない作品、または「NOW PRINTING」の画像しか無いものを除外
+        img_urls = item.get("imageURL") or {}
+        large_img = img_urls.get("large") or ""
+        small_img = img_urls.get("small") or ""
+        if not large_img and not small_img:
+            continue
+        if "now_printing" in large_img or "now_printing" in small_img:
+            continue
+        if "printing" in large_img or "printing" in small_img:
             continue
 
         filtered.append(item)
